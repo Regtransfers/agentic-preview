@@ -62,12 +62,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Container registries reject uppercase, and ${{ github.repository }}
+      # carries whatever case the owner and repo were created with. Lowercased
+      # here so a fork publishes into its own namespace rather than the
+      # upstream's -- the one reference that must follow the fork, not the
+      # project.
+      - name: Derive the image name from this repository
+        id: image
+        run: |
+          set -euo pipefail
+          echo "name=ghcr.io/$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
       # Emits the moving tags plus the OCI labels that link the package back to
       # this repository, this commit and the Apache-2.0 licence.
       - id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/alchemy86/agentic-preview
+          images: ${{ steps.image.outputs.name }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -97,7 +108,7 @@ jobs:
             echo '## Published'
             echo
             echo '```'
-            echo 'ghcr.io/alchemy86/agentic-preview@${{ steps.build.outputs.digest }}'
+            echo '${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}'
             echo '```'
             echo
             echo 'Tags:'
