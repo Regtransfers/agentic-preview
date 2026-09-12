@@ -56,6 +56,13 @@ type scheduleState struct {
 	// entry an intercept schedule looks itself up by. It is the controller's
 	// belief, checked against the ConfigMap on every tick rather than trusted.
 	applied bool
+	// swept is whether this process has ever managed to establish what the
+	// ConfigMap actually holds for this DNS schedule - by writing the line, or
+	// by looking for a stale one and either removing it or finding none. Until
+	// it is true a shut window keeps sweeping on every tick, because the thing
+	// being ruled out is a live redirect nobody declared and one failed API
+	// call is not a reason to stop ruling it out.
+	swept bool
 }
 
 // ScheduleStatus is one schedule as the API reports it.

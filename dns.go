@@ -168,6 +168,12 @@ func indentOf(s string) string { return s[:len(s)-len(strings.TrimLeft(s, " \t")
 // SWEEPS: a window that is shut but whose line is still there - the pod was
 // killed mid-window, or the clock moved - has it removed, because a redirect
 // nobody declared is live is exactly the failure this mode must not have.
+//
+// The sweep is keyed on st.swept, not on which tick this is. A replacement pod
+// starting into a briefly unavailable API server is exactly the moment the
+// sweep is needed and exactly the moment it fails, so one failed attempt must
+// not be the only attempt: until a sweep succeeds, every tick of a shut window
+// tries again and the failure is a `problem` on GET /schedules meanwhile.
 func (s *Server) reconcileDNSSchedule(ctx context.Context, sc *schedule, now time.Time) {
 	st := s.scheduleStateFor(sc.spec.Name)
 	want, forced := s.desiredOpen(sc, now)
@@ -196,8 +202,8 @@ func (s *Server) reconcileDNSSchedule(ctx context.Context, sc *schedule, now tim
 		s.openDNSWindow(ctx, sc, st, now)
 	case want:
 		s.checkDNSWindow(ctx, sc, st, now)
-	case st.applied || first:
-		s.closeDNSWindow(ctx, sc, st, now, first && !st.applied)
+	case st.applied || !st.swept:
+		s.closeDNSWindow(ctx, sc, st, now, !st.applied)
 	default:
 		st.Up, st.Problem = false, ""
 	}
@@ -208,11 +214,13 @@ func (s *Server) reconcileDNSSchedule(ctx context.Context, sc *schedule, now tim
 func (s *Server) openDNSWindow(ctx context.Context, sc *schedule, st *scheduleState, now time.Time) {
 	changed, err := s.writeHostsLine(ctx, sc, true)
 	if err != nil {
-		st.Up, st.applied = false, false
+		// Not knowing whether the line is there is the same state a fresh pod
+		// is in, so the next shut window must sweep rather than assume.
+		st.Up, st.applied, st.swept = false, false, false
 		s.alarm(sc, st, now, "opening the DNS redirect: "+err.Error())
 		return
 	}
-	st.Up, st.applied, st.Problem, st.lastAlarm = true, true, "", time.Time{}
+	st.Up, st.applied, st.swept, st.Problem, st.lastAlarm = true, true, true, "", time.Time{}
 	st.raisedAt = now
 	st.Raises++
 	if changed {
@@ -259,33 +267,36 @@ func (s *Server) checkDNSWindow(ctx context.Context, sc *schedule, st *scheduleS
 	st.Up, st.ReRaises = false, st.ReRaises+1
 
 	if _, err := s.writeHostsLine(ctx, sc, true); err != nil {
-		st.applied = false
+		st.applied, st.swept = false, false
 		s.alarm(sc, st, now, "re-applying the DNS redirect: "+err.Error())
 		return
 	}
-	st.applied, st.Up, st.Problem, st.lastAlarm = true, true, "", time.Time{}
+	st.applied, st.Up, st.swept, st.Problem, st.lastAlarm = true, true, true, "", time.Time{}
 	st.raisedAt = now
 }
 
-// closeDNSWindow takes the line back out. sweep marks the first-tick cleanup of
-// a line this process did not write - a window that was open when the previous
-// pod was killed - where finding nothing is the normal case and not news.
+// closeDNSWindow takes the line back out. sweep marks the cleanup of a line
+// this process did not write - a window that was open when the previous pod was
+// killed - where finding nothing is the normal case and not news.
+//
+// A failed sweep is news, though, and it is the one failure that hides a live
+// redirect: nothing was removed, nothing is known, and the window may not open
+// again for days. So it alarms like every other failure here and leaves swept
+// false, which is what brings the next tick back to try again.
 func (s *Server) closeDNSWindow(ctx context.Context, sc *schedule, st *scheduleState, now time.Time, sweep bool) {
 	changed, err := s.writeHostsLine(ctx, sc, false)
 	if err != nil {
+		st.Up = false
 		if sweep {
-			// Nothing is known to be applied and the window is shut: say it
-			// once and let the next tick that has something to do alarm.
-			logf("schedule %s: could not check %s for a stale redirect of %s: %v",
-				sc.spec.Name, s.dnsTargetRef(), sc.hostname, err)
+			s.alarm(sc, st, now, "checking "+s.dnsTargetRef()+" for a stale redirect of "+
+				sc.hostname+": "+err.Error()+" - it may still resolve to "+sc.redirectTo)
 			return
 		}
-		st.Up = false
 		s.alarm(sc, st, now, "closing the DNS redirect: "+err.Error()+
 			" - "+sc.hostname+" may still resolve to "+sc.redirectTo)
 		return
 	}
-	st.applied, st.Up, st.Problem = false, false, ""
+	st.applied, st.Up, st.swept, st.Problem = false, false, true, ""
 	if changed {
 		logf("schedule %s: redirect for %s removed from %s; it resolves normally again",
 			sc.spec.Name, sc.hostname, s.dnsTargetRef())

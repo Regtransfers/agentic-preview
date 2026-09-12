@@ -8,6 +8,12 @@
 #      deployment.yaml
 #   3. uncomment the `schedules` volumeMount and volume in deployment.yaml
 #
+# A FOURTH, and only because the example below declares a `type: dns` entry
+# (`db-offhours`): uncomment the three SCHEDULE_DNS_CONFIGMAP_* env entries in
+# deployment.yaml too, or delete that entry. A declared DNS schedule with no
+# ConfigMap configured is fatal at boot - deliberately, see below - so the three
+# edits on their own would leave the pod in CrashLoopBackOff.
+#
 # The twin of this file in the Helm chart does all three from one
 # `schedules:` list in values.yaml; see charts/agentic-preview/values.yaml.
 #

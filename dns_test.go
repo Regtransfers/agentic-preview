@@ -329,6 +329,73 @@ func TestDNSFirstTickSweepsAStaleLine(t *testing.T) {
 	}
 }
 
+// TestDNSFailedSweepIsRetriedAndAlarms is the failure mode the happy sweep
+// above hides. A replacement pod starting into a briefly unavailable API
+// server is exactly when the sweep matters and exactly when it fails, and a
+// sweep is not a one-shot: while it has not succeeded, every tick of a shut
+// window tries again, and the stale redirect it cannot rule out is a `problem`
+// on GET /schedules rather than one log line nobody reads.
+func TestDNSFailedSweepIsRetriedAndAlarms(t *testing.T) {
+	sc := sqlOffHours(t)
+	stale := "hosts {\n    10.42.0.9 dev-sql.example.internal # agentic-preview:sql-offhours\n    " +
+		otherLine + "\n    fallthrough\n}\n"
+	s, cs := dnsServer(t, stale, sc)
+
+	down := true
+	cs.PrependReactor("get", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if down {
+			return true, nil, apierrors.NewServiceUnavailable("the API server is not answering")
+		}
+		return false, nil, nil
+	})
+
+	ctx := context.Background()
+	// Three shut-window ticks while the API server is unreachable. Every one
+	// of them must still be trying, and saying so.
+	for i, when := range []string{"2026-09-14 09:00", "2026-09-14 09:01", "2026-09-14 09:02"} {
+		s.reconcileDNSSchedule(ctx, sc, at(t, sc, when))
+		st := s.scheduleStateFor(sc.spec.Name)
+		if st.Problem == "" {
+			t.Fatalf("tick %d: a sweep that could not run reported no problem: %+v", i, st)
+		}
+		if !strings.Contains(st.Problem, "stale redirect") {
+			t.Fatalf("tick %d: problem does not say what could not be ruled out: %q", i, st.Problem)
+		}
+		if st.Up {
+			t.Fatalf("tick %d: nothing is up while the window is shut: %+v", i, st)
+		}
+	}
+	// Nothing was written, so the stale line is necessarily still there - the
+	// ConfigMap cannot be read back to say so while the reactor is failing
+	// reads, which is the point of asserting on the writes instead.
+	if n := countUpdates(cs); n != 0 {
+		t.Fatalf("a sweep whose read failed still wrote to the ConfigMap %d time(s)", n)
+	}
+
+	// The API server comes back. The very next tick finishes the sweep.
+	down = false
+	s.reconcileDNSSchedule(ctx, sc, at(t, sc, "2026-09-14 09:03"))
+
+	got := data(t, cs)
+	if strings.Contains(got, "agentic-preview:sql-offhours") {
+		t.Fatalf("the retried sweep left the stale redirect live:\n%s", got)
+	}
+	if !strings.Contains(got, otherLine) {
+		t.Fatalf("the sweep took somebody else's line with it:\n%s", got)
+	}
+	st := s.scheduleStateFor(sc.spec.Name)
+	if st.Problem != "" {
+		t.Fatalf("a completed sweep should clear the problem: %q", st.Problem)
+	}
+
+	// And it is done: a shut window that has been swept writes nothing more.
+	before := countUpdates(cs)
+	s.reconcileDNSSchedule(ctx, sc, at(t, sc, "2026-09-14 09:04"))
+	if after := countUpdates(cs); after != before {
+		t.Fatalf("a swept, shut window wrote to the ConfigMap again: %d writes became %d", before, after)
+	}
+}
+
 // TestOverrideForcesAWindowAndReleasesIt is the on-demand lever: force it open
 // outside its window, force it shut inside, and hand it back. Note what it is
 // NOT - a replacement for the loop. A forced-open redirect that drifts is

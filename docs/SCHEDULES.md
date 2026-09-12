@@ -251,7 +251,15 @@ fighting the controller, and winning between ticks.
 
 A restart re-derives everything from the ConfigMap rather than from memory, which also covers
 the ugly case: a pod killed mid-window leaves a redirect live that nothing has declared, and
-the replacement's **first tick sweeps it** if the window has since closed.
+the replacement **sweeps it** on its first tick if the window has since closed.
+
+That sweep is not a one-shot. A replacement pod coming up into a briefly unavailable API
+server is both when the sweep matters most and when it is most likely to fail, so until one
+succeeds every tick of a shut window tries again, and the redirect it has not been able to
+rule out shows as a `problem` on `GET /schedules` in the meantime — not as a single log line.
+The same applies after any failed write: a schedule that could not be opened, re-applied or
+closed no longer knows what the ConfigMap holds, so its next shut window sweeps rather than
+assumes.
 
 ### Reading a DNS entry back
 

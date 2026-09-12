@@ -414,5 +414,5 @@ case ${1:-} in
   schedules|sched) shift; cmd_schedules "$@" ;;
   override)       shift; cmd_override "$@" ;;
   '')             usage; exit 0 ;;
-  *)              die "unknown command: $1. There are five: up, list, down, status, schedules. Try: $PROG --help" ;;
+  *)              die "unknown command: $1. There are six: up, list, down, status, schedules, override. Try: $PROG --help" ;;
 esac
