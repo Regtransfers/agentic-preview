@@ -474,3 +474,71 @@ func TestOneNamespaceLosingItsSessionLeavesTheOthersUp(t *testing.T) {
 		t.Fatal("shop's agent pods were forgotten with identity's session")
 	}
 }
+
+// TestConcurrentReconcilesDialEachAgentOnce is the regression test for the race
+// that a watcher per namespace made reachable.
+//
+// A traffic-agent has ONE dial slot per client session. A second WatchDial to
+// the same agent displaces the first, so two reconcile passes dialling the same
+// pod leave the agent holding the loser's watcher, which the loser then cancels
+// on finding it lost the pool entry - and the pool goes on reporting a tunnel
+// for a pod that has nobody listening. Its traffic is HELD, which is exactly the
+// failure this whole change exists to remove, arrived at from the other
+// direction.
+//
+// One watcher could not race itself. Measured on a real cluster with a watcher
+// per namespace and a two-replica workload: one replica served, the other hung,
+// both tunnels reported up.
+//
+// The assertion is on the AGENT's count of WatchDial calls, not on the pool's
+// view of itself, because the pool's view was correct throughout the failure.
+func TestConcurrentReconcilesDialEachAgentOnce(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	shop := scheduledPreview("checkout-api", "shop")
+	auth := scheduledPreview("keycloak", "identity")
+	s := poolFor(t, shop, auth)
+
+	shopA := newFakeAgent(t, "tel-node-agent-checkout-api-aaa")
+	shopB := newFakeAgent(t, "tel-node-agent-checkout-api-bbb")
+	authA := newFakeAgent(t, "tel-node-agent-keycloak-aaa")
+	authB := newFakeAgent(t, "tel-node-agent-keycloak-bbb")
+	agents := []*fakeAgent{shopA, shopB, authA, authB}
+
+	snapshot(s.agents, "shop", shopA.info("checkout-api", "shop"), shopB.info("checkout-api", "shop"))
+	snapshot(s.agents, "identity", authA.info("keycloak", "identity"), authB.info("keycloak", "identity"))
+
+	// Several passes at once, as two namespace watchers reconciling the one
+	// pool produce: each has its own stream, its own ticker and its share of
+	// the kicks a raise sends.
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.agents.reconcile(ctx)
+		}()
+	}
+	wg.Wait()
+
+	for _, a := range agents {
+		a := a
+		eventually(t, "a dial loop on "+a.podName, func() bool {
+			w, tn := a.counts()
+			return w >= 1 && tn >= 1
+		})
+	}
+
+	// Exactly one WatchDial per agent. More than one means the agent's dial
+	// slot was taken twice, and the tunnel the pool believes it holds is the
+	// one that lost.
+	for _, a := range agents {
+		if w, _ := a.counts(); w != 1 {
+			t.Fatalf("%s saw %d WatchDial call(s), want exactly 1: its dial slot was claimed more than once", a.podName, w)
+		}
+	}
+	if got := len(s.agents.status()["checkout-api.shop"]) + len(s.agents.status()["keycloak.identity"]); got != 4 {
+		t.Fatalf("pool holds %d tunnel(s), want 4", got)
+	}
+}

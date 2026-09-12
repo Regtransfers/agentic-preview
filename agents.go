@@ -89,15 +89,29 @@ type agentPool struct {
 	mu     sync.Mutex
 	conns  map[string]*agentConn               // by pod key
 	latest map[string]*managerrpc.AgentPodInfo // last snapshot, by pod key
-	kick   chan struct{}
+	// establishing is the pod keys a reconcile pass has claimed but not yet
+	// finished dialling. It exists because an agent has ONE dial slot: a
+	// second WatchDial to the same agent and session displaces the first, so
+	// two passes dialling the same pod leave the agent holding a watcher that
+	// the losing pass then cancels - and the pool still reporting a tunnel.
+	// The pod is then ACTIVE with nothing listening, which HOLDS its traffic.
+	//
+	// One watcher could not race itself; a watcher per namespace can, because
+	// they reconcile the one pool concurrently. Measured after that change: a
+	// two-replica workload served one replica and hung the other, with both
+	// tunnels reported up, which is indistinguishable from the bug the per-pod
+	// keying fixed and is not the same bug at all.
+	establishing map[string]bool
+	kick         chan struct{}
 }
 
 func newAgentPool(srv *Server) *agentPool {
 	return &agentPool{
-		srv:    srv,
-		conns:  map[string]*agentConn{},
-		latest: map[string]*managerrpc.AgentPodInfo{},
-		kick:   make(chan struct{}, 1),
+		srv:          srv,
+		conns:        map[string]*agentConn{},
+		latest:       map[string]*managerrpc.AgentPodInfo{},
+		establishing: map[string]bool{},
+		kick:         make(chan struct{}, 1),
 	}
 }
 
@@ -242,7 +256,17 @@ func (p *agentPool) reconcile(ctx context.Context) {
 		if _, live := p.conns[podKey]; live {
 			continue
 		}
+		if p.establishing[podKey] {
+			// Another pass is already dialling this agent. Dialling it too
+			// would put a second WatchDial in its single dial slot.
+			continue
+		}
 		establish = append(establish, todo{podKey, ai})
+	}
+	// Claimed here, under the same lock that decided them, so a concurrent
+	// pass sees the claim rather than the not-yet-established tunnel.
+	for _, td := range establish {
+		p.establishing[td.podKey] = true
 	}
 	p.mu.Unlock()
 
@@ -298,6 +322,15 @@ func (p *agentPool) publish() {
 // in the manager's namespace, and the API port is fresh per Job.
 func (p *agentPool) establish(ctx context.Context, ai *managerrpc.AgentPodInfo) error {
 	agentKey, podKey, ns := agentKeyOf(ai), podKeyOf(ai), ai.GetNamespace()
+
+	// The claim reconcile took on this pod key is released however this
+	// returns - the entry in conns is what a later pass reads, and a claim
+	// left behind would stop the tunnel ever being rebuilt.
+	defer func() {
+		p.mu.Lock()
+		delete(p.establishing, podKey)
+		p.mu.Unlock()
+	}()
 
 	podIP, ok := netip.AddrFromSlice(ai.GetPodIp())
 	if !ok {
@@ -356,7 +389,11 @@ func (p *agentPool) establish(ctx context.Context, ai *managerrpc.AgentPodInfo) 
 	}
 
 	p.mu.Lock()
-	// Another pass may have got here first.
+	// Should be unreachable: reconcile claims the pod key in `establishing`
+	// before dialling, so no second pass gets this far for the same agent.
+	// Kept as the last resort for any future caller that does not claim -
+	// note that reaching it has already cost the winner its dial slot, so it
+	// is a bug to rely on rather than a branch to take.
 	if _, exists := p.conns[podKey]; exists {
 		p.mu.Unlock()
 		cancel()
